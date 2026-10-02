@@ -170,7 +170,7 @@ jobs:
         timeout-minutes: 10
         with:
           secret: ${{ secrets.GITHUB_TOKEN }}
-          approvers: alerabello
+          approvers: ViniciusFelipe2
           minimum-approvals: 1
           issue-body-file-path: plan-summary.md
           additional-approved-words: 'Approve, Approved, approve, approved'
