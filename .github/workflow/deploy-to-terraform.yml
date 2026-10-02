@@ -1,0 +1,271 @@
+name: Terraform - Multiple AWS Accounts
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform (apply or destroy)'
+        required: true
+        default: 'apply'
+      aws_account:
+        description: 'AWS Account to deploy to (network, prod, stage, develop)'
+        required: true
+      terraform_version:
+        description: 'Version of Terraform to use'
+        required: true
+        default: '1.14.0'
+
+env:
+  AWS_REGION: us-east-2
+  TF_STATE_KEY_PREFIX: tf-vpc
+  TFLINT_VERSION: v0.63.1
+  VALID_AWS_ACCOUNTS: 'network|prod|stage|develop'
+  VALID_ACTIONS: 'apply|destroy'
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      id-token: write
+      contents: read
+    timeout-minutes: 5
+    environment: ${{ github.event.inputs.aws_account }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7.0.1
+
+      - name: Validate Inputs
+        run: |
+          if ! [[ "${{ github.event.inputs.aws_account }}" =~ ^(${VALID_AWS_ACCOUNTS})$ ]]; then
+            echo "❌ Invalid AWS account specified: ${{ github.event.inputs.aws_account }}"
+            exit 1
+          fi
+          if ! [[ "${{ github.event.inputs.action }}" =~ ^(${VALID_ACTIONS})$ ]]; then
+            echo "❌ Invalid action specified: ${{ github.event.inputs.action }}"
+            exit 1
+          fi
+
+      - name: Set role-to-assume
+        id: set-role
+        run: |
+          case "${{ github.event.inputs.aws_account }}" in
+            network)
+              if [ -z "${{ secrets.AWS_ROLE_ARN_NETWORK }}" ]; then
+                echo "❌ Secret AWS_ROLE_ARN_NETWORK is not defined or accessible"
+                exit 1
+              fi
+              echo "role=${{ secrets.AWS_ROLE_ARN_NETWORK }}" >> $GITHUB_OUTPUT
+              ;;
+            prod)
+              if [ -z "${{ secrets.AWS_ROLE_ARN_PROD }}" ]; then
+                echo "❌ Secret AWS_ROLE_ARN_PROD is not defined or accessible"
+                exit 1
+              fi
+              echo "role=${{ secrets.AWS_ROLE_ARN_PROD }}" >> $GITHUB_OUTPUT
+              ;;
+            stage)
+              if [ -z "${{ secrets.AWS_ROLE_ARN_STAGE }}" ]; then
+                echo "❌ Secret AWS_ROLE_ARN_STAGE is not defined or accessible"
+                exit 1
+              fi
+              echo "role=${{ secrets.AWS_ROLE_ARN_STAGE }}" >> $GITHUB_OUTPUT
+              ;;
+            develop)
+              if [ -z "${{ secrets.AWS_ROLE_ARN_DEVELOP }}" ]; then
+                echo "❌ Secret AWS_ROLE_ARN_DEVELOP is not defined or accessible"
+                exit 1
+              fi
+              echo "role=${{ secrets.AWS_ROLE_ARN_DEVELOP }}" >> $GITHUB_OUTPUT
+              ;;
+            *)
+              echo "❌ Invalid account: ${{ github.event.inputs.aws_account }}"
+              exit 1
+              ;;
+          esac
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v6.2.3
+        with:
+          role-to-assume: ${{ steps.set-role.outputs.role }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Cache Terraform files
+        uses: actions/cache@v6.1.0
+        with:
+          path: |
+            .terraform
+            .terraform.lock.hcl
+          key: ${{ runner.os }}-terraform-${{ hashFiles('**/*.tf') }}
+
+      - name: Install TFLint
+        run: |
+          curl -L "https://github.com/terraform-linters/tflint/releases/download/${TFLINT_VERSION}/tflint_linux_amd64.zip" -o tflint.zip
+          unzip tflint.zip
+          sudo mv tflint /usr/local/bin/
+          rm tflint.zip
+
+      - name: Lint Terraform files
+        run: tflint
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4.0.1
+        with:
+          terraform_version: ${{ github.event.inputs.terraform_version }}
+
+      - name: Initialize Terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="key=${TF_STATE_KEY_PREFIX}/${{ github.event.inputs.aws_account }}/terraform.tfstate"
+
+      - name: Plan Terraform changes
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event.inputs.action }}" == "destroy" ]; then
+            terraform plan -destroy -out=tfplan -no-color | tee plan-output.txt
+          else
+            terraform plan -out=tfplan -no-color | tee plan-output.txt
+          fi
+
+      - name: Prepare plan summary for approval issue
+        run: |
+          {
+            echo "### Terraform plan — run ${{ github.run_id }} (últimas 1000 linhas)"
+            echo '```diff'
+            tail -n 1000 plan-output.txt
+            echo '```'
+          } > plan-summary.md
+
+      - name: Upload Terraform plan
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: tfplan
+          path: tfplan
+
+      - name: Upload plan summary
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: plan-summary
+          path: plan-summary.md
+
+  approval:
+    needs: plan
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      issues: write
+      id-token: write
+      contents: write
+    environment: ${{ github.event.inputs.aws_account }}
+    steps:
+      - name: Download plan summary
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: plan-summary
+
+      - name: Request Manual Approval
+        uses: trstringer/manual-approval@v1
+        timeout-minutes: 10
+        with:
+          secret: ${{ secrets.GITHUB_TOKEN }}
+          approvers: alerabello
+          minimum-approvals: 1
+          issue-body-file-path: plan-summary.md
+          additional-approved-words: 'Approve, Approved, approve, approved'
+
+  deploy:
+    needs: approval
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    timeout-minutes: 20
+    environment: ${{ github.event.inputs.aws_account }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7.0.1
+
+      - name: Validate Inputs
+        run: |
+          if ! [[ "${{ github.event.inputs.aws_account }}" =~ ^(${VALID_AWS_ACCOUNTS})$ ]]; then
+            echo "❌ Invalid AWS account specified: ${{ github.event.inputs.aws_account }}"
+            exit 1
+          fi
+          if ! [[ "${{ github.event.inputs.action }}" =~ ^(${VALID_ACTIONS})$ ]]; then
+            echo "❌ Invalid action specified: ${{ github.event.inputs.action }}"
+            exit 1
+          fi
+
+      - name: Set role-to-assume
+        id: set-role
+        run: |
+          case "${{ github.event.inputs.aws_account }}" in
+            network)
+              if [ -z "${{ secrets.AWS_ROLE_ARN_NETWORK }}" ]; then
+                echo "❌ Secret AWS_ROLE_ARN_NETWORK is not defined or accessible"
+                exit 1
+              fi
+              echo "role=${{ secrets.AWS_ROLE_ARN_NETWORK }}" >> $GITHUB_OUTPUT
+              ;;
+            prod)
+              if [ -z "${{ secrets.AWS_ROLE_ARN_PROD }}" ]; then
+                echo "❌ Secret AWS_ROLE_ARN_PROD is not defined or accessible"
+                exit 1
+              fi
+              echo "role=${{ secrets.AWS_ROLE_ARN_PROD }}" >> $GITHUB_OUTPUT
+              ;;
+            stage)
+              if [ -z "${{ secrets.AWS_ROLE_ARN_STAGE }}" ]; then
+                echo "❌ Secret AWS_ROLE_ARN_STAGE is not defined or accessible"
+                exit 1
+              fi
+              echo "role=${{ secrets.AWS_ROLE_ARN_STAGE }}" >> $GITHUB_OUTPUT
+              ;;
+            develop)
+              if [ -z "${{ secrets.AWS_ROLE_ARN_DEVELOP }}" ]; then
+                echo "❌ Secret AWS_ROLE_ARN_DEVELOP is not defined or accessible"
+                exit 1
+              fi
+              echo "role=${{ secrets.AWS_ROLE_ARN_DEVELOP }}" >> $GITHUB_OUTPUT
+              ;;
+            *)
+              echo "❌ Invalid account: ${{ github.event.inputs.aws_account }}"
+              exit 1
+              ;;
+          esac
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v6.2.3
+        with:
+          role-to-assume: ${{ steps.set-role.outputs.role }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4.0.1
+        with:
+          terraform_version: ${{ github.event.inputs.terraform_version }}
+
+      - name: Download Terraform Plan
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: tfplan
+          path: ./tfplan
+
+      - name: Move Terraform plan
+        run: mv ./tfplan/tfplan ./tfplan.tfplan
+
+      - name: Initialize Terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="key=${TF_STATE_KEY_PREFIX}/${{ github.event.inputs.aws_account }}/terraform.tfstate"
+
+      - name: Validate Terraform Plan
+        run: terraform show -json ./tfplan.tfplan | jq .
+
+      - name: Apply Terraform Plan
+        run: terraform apply -auto-approve ./tfplan.tfplan
