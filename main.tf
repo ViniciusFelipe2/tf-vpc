@@ -40,7 +40,7 @@ module "vpc" {
   vpc_flow_log_iam_role_name            = "AMZ-Klinsync-flow-logs"
   vpc_flow_log_iam_role_use_name_prefix = false
   flow_log_destination_type             = "s3"
-  flow_log_destination_arn              = "arn:aws:s3:::logs-vpc-Klinsync"
+  flow_log_destination_arn              = "arn:aws:s3:::logs-vpc-klinsync"
 
   # Security Groups
   default_security_group_ingress = [
